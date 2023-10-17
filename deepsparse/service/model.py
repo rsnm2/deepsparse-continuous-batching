@@ -7,7 +7,8 @@ from typing import Optional, List, Dict
 from deepsparse import Context
 from deepsparse.engine import LIB
 from deepsparse.pipeline import DEEPSPARSE_ENGINE, create_engine
-from deepsparse.transformers.utils.helpers import overwrite_onnx_model_inputs_for_kv_cache_models, create_causal_mask
+from deepsparse.transformers.utils.helpers import create_causal_mask
+from deepsparse.utils.onnx import overwrite_onnx_model_inputs_for_kv_cache_models
 
 PAST_KEY_VALUES_NAME = "past_key_values"
 
