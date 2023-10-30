@@ -214,9 +214,6 @@ class DeepSparseCausalLM:
             batch.next_token_chooser_list,
         )
 
-        assert len(input_ids.shape) == 2
-        assert input_ids.shape[0] == len(batch.requests)
-
         # a) run inference
         logits, batch.past_key_values_list = self.model(batch.input_ids_list, batch.past_key_values_list)
 
