@@ -176,6 +176,8 @@ class DeepSparseCausalLM:
         self,
         model_path: str, 
         tokenizer_path: str,
+        batch_size: int = 1,
+        num_threads: int = None,
     ):   
         # setup tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
@@ -189,7 +191,8 @@ class DeepSparseCausalLM:
             onnx_file_path = model_path,
             sequence_length = DEEPSPARSE_SEQUENCE_LENGTH,
             multitoken_length = DEEPSPARSE_MULTITOKEN_LENGTH,
-            batch_size=4
+            batch_size=batch_size,
+            num_threads=num_threads
         )
 
     def generate_token(
@@ -241,7 +244,8 @@ class DeepSparseCausalLM:
         ) in enumerate(iterator):
             # b) sample token and check stopping criteria
             # TODO: should use NextTokenChooser/StoppingCriteria (simple for now)
-            generated_token_id = next_token_chooser(input_ids=input_ids, scores=logits[:,-1,:])
+            #generated_token_id = next_token_chooser(input_ids=input_ids, scores=logits[:,-1,:])
+            generated_token_id = next_token_chooser(input_ids=input_ids, scores=logits[i:i+1,-1,:])
             generated_token = self.tokenizer.decode(generated_token_id)
             
             stop, finish_reason = stopping_criteria(generated_token_id=generated_token_id)

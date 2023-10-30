@@ -10,6 +10,9 @@ from deepsparse.pipeline import DEEPSPARSE_ENGINE, create_engine
 from deepsparse.utils.onnx import overwrite_onnx_model_inputs_for_kv_cache_models
 from deepsparse.transformers.utils.helpers import create_causal_mask
 
+
+import sys  # debugging
+
 PAST_KEY_VALUES_NAME = "past_key_values"
 
 def chunkify(lst, n):
@@ -30,6 +33,7 @@ class DeepSparseDecoderEngine:
         sequence_length: int = 1024,
         input_ids_length: int = 1,
         batch_size: int = 1,
+        num_threads: int = None,
         engine_context: Optional[Context] = None,
     ):
 
@@ -45,12 +49,12 @@ class DeepSparseDecoderEngine:
         #self.engine_type = "onnxruntime"
 
         if self.engine_type == DEEPSPARSE_ENGINE:
-            engine_args = {"cached_outputs": cached_outputs, "batch_size": batch_size}
+            engine_args = {"cached_outputs": cached_outputs, "batch_size": batch_size, "num_cores": num_threads}
         else:
             engine_args = {"batch_size": batch_size}
 
         # compile engine
-        print(f"compiling for batch size: {batch_size}")
+        print(f"compiling for batch size/sequence length/input ids length: {batch_size}/{sequence_length}/{input_ids_length}")
         self.engine = create_engine(
             onnx_file_path=onnx_file_path,
             engine_type=self.engine_type,
@@ -118,11 +122,21 @@ class DeepSparseDecoderModel:
         sequence_length: int = 1024,
         multitoken_length: int = 16,
         batch_size: int = 1,  # 16
+        num_threads: int = None,
         engine_context: Optional[Context] = None,
     ):
         self.sequence_length = sequence_length
         self.multitoken_length = multitoken_length
         self.batch_size = batch_size
+
+        # compile prefill engine
+        self.multitoken_engine = DeepSparseDecoderEngine(
+            onnx_file_path=onnx_file_path,
+            engine_context=engine_context,
+            sequence_length=sequence_length,
+            input_ids_length=self.multitoken_length,
+            num_threads=num_threads
+        )
 
         # compile decode engines
         self.singletoken_engine = DeepSparseDecoderEngine(
@@ -130,7 +144,8 @@ class DeepSparseDecoderModel:
             engine_context=engine_context,
             sequence_length=sequence_length,
             input_ids_length=1,
-            batch_size=1
+            batch_size=1,
+            num_threads=num_threads
         )
 
         if batch_size > 1:
@@ -139,23 +154,19 @@ class DeepSparseDecoderModel:
                 engine_context=engine_context,
                 sequence_length=sequence_length,
                 input_ids_length=1,
-                batch_size=batch_size
+                batch_size=batch_size,
+                num_threads=num_threads
             )
         else:
             self.batched_singletoken_engine = None
-
-        # compile prefill engine
-        self.multitoken_engine = DeepSparseDecoderEngine(
-            onnx_file_path=onnx_file_path,
-            engine_context=engine_context,
-            sequence_length=sequence_length,
-            input_ids_length=self.multitoken_length,
-        )
 
         assert "input_ids" in self.singletoken_engine.onnx_inputs
         assert "attention_mask" in self.singletoken_engine.onnx_inputs
         assert "causal_mask" in self.singletoken_engine.onnx_inputs
         assert "positions" in self.singletoken_engine.onnx_inputs
+
+        # for debugging
+        self.decode_count = 0
 
     def engine_inputs_for_prefill(
         self,
@@ -219,12 +230,16 @@ class DeepSparseDecoderModel:
         engine_inputs["input_ids"] = np.concatenate(last_input_ids, axis=0)
 
         engine_inputs["attention_mask"] = np.zeros((batch_size, self.sequence_length), dtype=np.int64)
-        engine_inputs["attention_mask"][:, -input_ids[0].shape[1]:] = 1
+        #engine_inputs["attention_mask"][:, -input_ids[0].shape[1]:] = 1
+        for b in range(batch_size):
+            engine_inputs["attention_mask"][b, -input_ids[b].shape[1]:] = 1
 
         engine_inputs["causal_mask"] = create_causal_mask(
             engine_inputs["input_ids"],
             engine_inputs["attention_mask"]
         )
+
+        #print(f"{engine_inputs['causal_mask']}")
         poses = [pos.shape[1] - 1 for pos in input_ids]
         #print(f"poses {poses}")
         engine_inputs["positions"] = np.array(poses, dtype=np.int64)[:,None]
@@ -236,7 +251,7 @@ class DeepSparseDecoderModel:
 
         return engine_inputs
     
-    def decode(
+    def decode_common(
         self,
         batched_input_ids: List[np.ndarray],
         batched_past_key_values: List[DeepSparsePastKeyValues]
@@ -259,30 +274,54 @@ class DeepSparseDecoderModel:
             assert len(input_ids[0].shape) == 2
             assert input_ids[0].shape[1] < self.sequence_length
 
+            engine_inputs = self.engine_inputs_for_decode(input_ids)
+            #print(engine_inputs)
+
             if len(input_ids) == self.batch_size and self.batch_size != 1:
-                engine_inputs = self.engine_inputs_for_decode(input_ids)
-                #print(f"GOT HERE!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! {past_key_values}")
+                print(f"BATCHED! {len(input_ids)} {self.batch_size} {past_key_values}")
                 logits, new_key_values = self.batched_singletoken_engine(
                     engine_inputs,
                     past_key_values
                 )
+                #print(f"DONE BATCHED! {len(input_ids)} {self.batch_size} {past_key_values}")
                 batched_logits.append(logits)
                 # XXXXX this is bogus
                 batched_new_key_values.append(new_key_values)
             else:
+                print(f"UNBATCHED! {len(input_ids)} {self.batch_size} {past_key_values}")
                 for i in range(len(input_ids)):
-                    engine_inputs = self.engine_inputs_for_decode([input_ids[i]])
+                    engine_inputs2 = {}
+                    engine_inputs2["input_ids"] = engine_inputs["input_ids"][i:i+1,:]
+                    engine_inputs2["attention_mask"] = engine_inputs["attention_mask"][i:i+1,:]
+                    engine_inputs2["causal_mask"] =engine_inputs["causal_mask"][i:i+1,:]
+                    engine_inputs2["positions"] = engine_inputs["positions"][i:i+1,:]
+
                     logits, new_key_values = self.singletoken_engine(
-                        engine_inputs,
+                        engine_inputs2,
                         past_key_values[i])
                     batched_logits.append(logits)
                     batched_new_key_values.append(new_key_values)
+                #print(f"DONE UNBATCHED! {past_key_values}")
 
         #print(f"decode {len(batched_input_ids)} {len(batched_new_key_values)}")
 
         # XXXXX this is bogus
         return np.concatenate(batched_logits, axis=0), batched_past_key_values
         #return np.concatenate(batched_logits, axis=0), np.concatenate(batched_new_key_values)
+
+
+    def decode(
+        self,
+        batched_input_ids: List[np.ndarray],
+        batched_past_key_values: List[DeepSparsePastKeyValues]
+    ) -> (np.ndarray, List[DeepSparsePastKeyValues]):
+        print(f"decode {self.decode_count}")
+        self.decode_count = self.decode_count + 1
+        logits, pkv = self.decode_common(batched_input_ids, batched_past_key_values)
+        #np.set_printoptions(threshold=sys.maxsize)
+        #print(f"end decode logits {logits}")
+        return logits, pkv
+
 
     def prefill(
         self,
@@ -297,28 +336,30 @@ class DeepSparseDecoderModel:
         tokens_processed = 0
         
         # setup empty past key values
-        past_key_values = [DeepSparsePastKeyValues()]
+        past_key_values = DeepSparsePastKeyValues()
 
         # loop through chunks, run inference w/ multitoken engine
         for engine_inputs in self.engine_inputs_for_prefill(input_ids):
-            logits, past_key_values[0] = self.multitoken_engine(
+            print(f"multi token prefill")
+            logits, fake_past_key_values = self.multitoken_engine(
                 engine_inputs,
-                past_key_values[0]
+                past_key_values
             )
             tokens_processed += self.multitoken_length
 
         # if anything left over, run inference w/ singletoken engine
         while tokens_processed < input_ids.shape[1]:
+            print(f"single token prefill")
             #print(f"got here {input_ids[:,:tokens_processed+1]}")
             assert len(input_ids.shape) == 2
-            logits, past_key_values = self.decode(
+            logits, fake_past_key_values = self.decode_common(
                 [input_ids[:,:tokens_processed+1]],
-                past_key_values
+                [past_key_values]
             )
             tokens_processed += 1
             # print(logits[:,-1:,:])
 
-        return logits, past_key_values
+        return logits, [past_key_values]
 
     def forward(
         self,
@@ -329,11 +370,15 @@ class DeepSparseDecoderModel:
         #print(f"forward pkv {past_key_values} {past_key_values[0] is None}")
         if past_key_values[0] is None:
             assert len(input_ids) == 1
-            #print("PREFILL!!!!!!!!!!!!!!!!!!!!!")
-            return self.prefill(input_ids[0])
+            #print("BEGIN PREFILL!!!!!!!!!!!!!!!!!!!!!")
+            res = self.prefill(input_ids[0])
+            #print("DONE PREFILL!!!!!!!!!!!!!!!!!!!!!")
+            return res
         else:
-            #print("DECODE!!!!!!!!!!!!!!!!!!!!!")
-            return self.decode(input_ids, past_key_values)
+            #print("BEGIN DECODE!!!!!!!!!!!!!!!!!!!!!")
+            res = self.decode(input_ids, past_key_values)
+            #print("DONE DECODE!!!!!!!!!!!!!!!!!!!!!")
+            return res
 
     def __call__(
         self,
