@@ -10,7 +10,7 @@ DEEPSPARSE_SEQUENCE_LENGTH = 128
 DEEPSPARSE_MULTITOKEN_LENGTH = 4
 
 @dataclass
-class DeepSparseCausalLMBatch:    
+class DeepSparseCausalLMBatch:
     batch_id: int
     requests: List[Request]
     requests_idx_mapping: Dict[int,int]
@@ -18,14 +18,14 @@ class DeepSparseCausalLMBatch:
     past_key_values_list: List[Optional[DeepSparsePastKeyValues]]
     stopping_criteria_list: List[StoppingCriteria]
     next_token_chooser_list: List[NextTokenChooser]
-    
+
     @classmethod
     def from_batch(
         cls,
         batch: Batch,
         tokenizer: PreTrainedTokenizerBase,
     ) -> "DeepSparseCausalLMBatch":
-        
+
         # parse batch
         requests_idx_mapping = {}
         input_ids_list = []
@@ -103,9 +103,9 @@ class DeepSparseCausalLMBatch:
         # loop through requests, keep ones that should remain
         for new_idx, request_id in enumerate(request_ids):
             assert request_id in self.requests_idx_mapping.keys(), "all request ids must be in the batch"
-            
+
             requests_idx_mapping[request_id] = new_idx
-            
+
             old_idx = self.requests_idx_mapping[request_id]
             requests.append(self.requests[old_idx])
             input_ids_list.append(self.input_ids_list[old_idx])
@@ -115,7 +115,7 @@ class DeepSparseCausalLMBatch:
 
         # update batch state
         self.requests = requests
-        self.requests_idx_mapping = requests_idx_mapping 
+        self.requests_idx_mapping = requests_idx_mapping
         self.input_ids_list = input_ids_list
         self.past_key_values_list = past_key_values_list
         self.stopping_criteria_list = stopping_criteria_list
@@ -140,12 +140,10 @@ class DeepSparseCausalLMBatch:
         start_index = 0
         for i, batch in enumerate(batches):
             assert batch.past_key_values_list is not None, "only concatenate prefilled batches"
-            
+
             # concatenate request, input_ids, and past_key_values lists
             requests.extend(batch.requests)
             input_ids_list.extend(batch.input_ids_list)
-            #print(f"pkv {past_key_values_list}")
-            #print(f"bpkv {batch.past_key_values_list}")
             past_key_values_list.extend(batch.past_key_values_list)
             stopping_criteria_list.extend(batch.stopping_criteria_list)
             next_token_chooser_list.extend(batch.next_token_chooser_list)
@@ -156,7 +154,7 @@ class DeepSparseCausalLMBatch:
             else:
                 for k, v in batch.requests_idx_mapping.items():
                     requests_idx_mapping[k] = v + start_index
-            
+
             start_index += len(batch)
 
         assert len(input_ids_list) == len(past_key_values_list)
@@ -174,18 +172,18 @@ class DeepSparseCausalLMBatch:
 class DeepSparseCausalLM:
     def __init__(
         self,
-        model_path: str, 
+        model_path: str,
         tokenizer_path: str,
         batch_size: int = 1,
         num_threads: int = None,
-    ):   
+    ):
         # setup tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         self.tokenizer.padding_side = "left"
         if not self.tokenizer.pad_token:
             assert self.tokenizer.eos_token
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        
+
         # setup model
         self.model = DeepSparseDecoderModel(
             onnx_file_path = model_path,
@@ -199,7 +197,7 @@ class DeepSparseCausalLM:
         self,
         batch: DeepSparseCausalLMBatch,
     ) -> (List[Generation], Optional[DeepSparseCausalLMBatch]):
-        
+
         generations: List[Generation] = []
         all_stopped = True
 
@@ -210,48 +208,35 @@ class DeepSparseCausalLM:
         #   d) update batch
 
         iterator = zip(
-            batch.requests, 
-            batch.input_ids_list, 
+            batch.requests,
+            batch.input_ids_list,
             batch.stopping_criteria_list,
             batch.next_token_chooser_list,
         )
 
-        #assert len(input_ids.shape) == 2
-        #assert input_ids.shape[0] == 1
-
-        #print(batch.past_key_values_list)
-        #print(len(batch.past_key_values_list))
-        #print(batch.input_ids_list)
-        #print(len(batch.input_ids_list))
-
-        #print(f"before {len(batch.input_ids_list)} {len(batch.past_key_values_list)}")
+        assert len(input_ids.shape) == 2
+        assert input_ids.shape[0] == len(batch.requests)
 
         # a) run inference
         logits, batch.past_key_values_list = self.model(batch.input_ids_list, batch.past_key_values_list)
 
-        #print(f"after {len(batch.input_ids_list)} {len(batch.past_key_values_list)} {batch.past_key_values_list}")
-
         assert len(batch.input_ids_list) == len(batch.past_key_values_list)
 
-        #print(logits)
-        #print(logits.shape)
-
         for i, (
-            request, 
-            input_ids, 
+            request,
+            input_ids,
             stopping_criteria,
             next_token_chooser
         ) in enumerate(iterator):
             # b) sample token and check stopping criteria
             # TODO: should use NextTokenChooser/StoppingCriteria (simple for now)
-            #generated_token_id = next_token_chooser(input_ids=input_ids, scores=logits[:,-1,:])
             generated_token_id = next_token_chooser(input_ids=input_ids, scores=logits[i:i+1,-1,:])
             generated_token = self.tokenizer.decode(generated_token_id)
-            
+
             stop, finish_reason = stopping_criteria(generated_token_id=generated_token_id)
             if not stop:
                 all_stopped = False
-                
+
             # c) make generation
             generations.append(Generation(
                 request_id=request.id,
@@ -261,10 +246,9 @@ class DeepSparseCausalLM:
                 finish_reason=finish_reason
             ))
 
-            # d) update batch 
+            # d) update batch
             # TODO: this does not occur in place
             assert len(batch.input_ids_list[i].shape) == 2
-            #assert batch.input_ids_list[i].shape[0] == 1
             batch.input_ids_list[i] = np.append(
                 batch.input_ids_list[i],
                 np.array([[generated_token_id]]),
@@ -274,6 +258,6 @@ class DeepSparseCausalLM:
         # if all elements of the batch are done, return null for batch
         if all_stopped:
             return generations, None
-        
+
         # return generation + updated batch
         return generations, batch
